@@ -270,5 +270,4 @@ az vm create \
 - Azure Image Builder Windows Docs: https://learn.microsoft.com/en-us/azure/virtual-machines/windows/image-builder
 - GitHub Actions Docs: https://docs.github.com/en/actions
 - Azure CLI Reference: https://learn.microsoft.com/en-us/cli/azure/reference-index
-
-https://git-scm.com/book/en/v2/Getting-Started-First-Time-Git-Setup
+- Getting Started - First-Time Git Setup: https://git-scm.com/book/en/v2/Getting-Started-First-Time-Git-Setup
