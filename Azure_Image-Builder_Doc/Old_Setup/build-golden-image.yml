@@ -1,0 +1,260 @@
+name: Build Golden Image Monthly
+
+on:
+  schedule:
+    - cron: '0 2 1 * *'  # Runs 1st of every month at 2:00 AM UTC (adjust timezone as needed)
+  workflow_dispatch:  # Allow manual trigger from Actions tab
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  RESOURCE_GROUP: rg-image-builder-useast
+  GALLERY_NAME: imgGalleryGolden
+  IMAGE_DEFINITION: win-golden-image
+  LOCATION: eastus
+  IDENTITY_NAME: imageBuilderIdentity
+
+jobs:
+  build-golden-image:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Azure Login with OIDC
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      
+      - name: Set environment variables
+        run: |
+          echo "TEMPLATE_NAME=win-golden-template-$(date +%Y%m%d-%H%M%S)" >> $GITHUB_ENV
+          echo "BUILD_DATE=$(date +%Y.%m.%d)" >> $GITHUB_ENV
+      
+      - name: Get managed identity details
+        run: |
+          IDENTITY_ID=$(az identity show \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --name ${{ env.IDENTITY_NAME }} \
+            --query id -o tsv)
+          echo "IDENTITY_ID=$IDENTITY_ID" >> $GITHUB_ENV
+          echo "✓ Managed identity retrieved: $IDENTITY_ID"
+      
+      - name: Create Image Builder JSON template
+        run: |
+          cat > image-template.json << 'TEMPLATE_EOF'
+          {
+            "type": "Microsoft.VirtualMachineImages/imageTemplates",
+            "apiVersion": "2022-07-01",
+            "location": "${{ env.LOCATION }}",
+            "identity": {
+              "type": "UserAssigned",
+              "userAssignedIdentities": {
+                "${{ env.IDENTITY_ID }}": {}
+              }
+            },
+            "properties": {
+              "source": {
+                "type": "PlatformImage",
+                "publisher": "MicrosoftWindowsServer",
+                "offer": "WindowsServer",
+                "sku": "2022-Datacenter",
+                "version": "latest"
+              },
+              "customize": [
+                {
+                  "name": "ApplyWindowsUpdates",
+                  "type": "WindowsUpdate",
+                  "searchCriteria": "IsInstalled=0",
+                  "filters": [
+                    "exclude:$_.Title -like '*Preview*'",
+                    "exclude:$_.Title -like '*Defender*'",
+                    "include:$_.Title -like '*Security*'",
+                    "include:$_.Title -like '*Cumulative*'"
+                  ],
+                  "updateLimit": 100
+                },
+                {
+                  "name": "InstallChocolatey",
+                  "type": "PowerShell",
+                  "inline": [
+                    "$ProgressPreference = 'SilentlyContinue'",
+                    "Set-ExecutionPolicy Bypass -Scope Process -Force",
+                    "[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072",
+                    "iex ((New-Object System.Net.ServicePointManager).SecurityProtocol = 'Tls12'; iwr https://community.chocolatey.org/install.ps1 -UseBasicParsing | iex)",
+                    "Write-Host 'Chocolatey installed successfully'"
+                  ]
+                },
+                {
+                  "name": "InstallSoftware",
+                  "type": "PowerShell",
+                  "inline": [
+                    "Write-Host 'Installing applications via Chocolatey'",
+                    "$apps = @('notepadplusplus', '7zip', 'git', 'curl', 'wget')",
+                    "foreach ($app in $apps) {",
+                    "  try {",
+                    "    choco install $app -y --no-progress",
+                    "    Write-Host \"✓ $app installed successfully\"",
+                    "  } catch {",
+                    "    Write-Warning \"✗ Failed to install $app: $_\"",
+                    "  }",
+                    "}",
+                    "Write-Host 'All applications installation completed'"
+                  ]
+                },
+                {
+                  "name": "ConfigureWindowsOptionalFeatures",
+                  "type": "PowerShell",
+                  "inline": [
+                    "Write-Host 'Configuring Windows optional features'",
+                    "Enable-WindowsOptionalFeature -FeatureName NetFx3 -Online -NoRestart -ErrorAction SilentlyContinue",
+                    "Enable-WindowsOptionalFeature -FeatureName IIS-WebServerRole -Online -NoRestart -ErrorAction SilentlyContinue",
+                    "Enable-WindowsOptionalFeature -FeatureName IIS-HealthAndDiagnostics -Online -NoRestart -ErrorAction SilentlyContinue",
+                    "Write-Host 'Windows features configured'"
+                  ]
+                },
+                {
+                  "name": "OptimizeImage",
+                  "type": "PowerShell",
+                  "inline": [
+                    "Write-Host 'Optimizing image'",
+                    "# Disable unnecessary services",
+                    "Get-Service -Name DiagTrack, dmwappushservice -ErrorAction SilentlyContinue | Set-Service -StartupType Disabled",
+                    "# Enable RDP",
+                    "Set-ItemProperty -Path 'HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server' -Name 'fDenyTSConnections' -Value 0",
+                    "# Set page file",
+                    "wmic computersystem where name=\\\"%computername%\\\" set AutomaticResetBootOption=True",
+                    "Write-Host 'Image optimization completed'"
+                  ]
+                },
+                {
+                  "name": "SysprepImage",
+                  "type": "WindowsRestart",
+                  "restartCheckCommand": "echo Azure Image Builder sysprep restart"
+                },
+                {
+                  "name": "FinalSysprep",
+                  "type": "PowerShell",
+                  "inline": [
+                    "Write-Host 'Running final sysprep'",
+                    "C:\\\\Windows\\\\System32\\\\Sysprep\\\\Sysprep.exe /oobe /generalize /shutdown /quiet /mode:vm",
+                    "Write-Host 'Sysprep initiated'"
+                  ]
+                }
+              ],
+              "distribute": [
+                {
+                  "type": "SharedImage",
+                  "galleryImageId": "/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/${{ env.RESOURCE_GROUP }}/providers/Microsoft.Compute/galleries/${{ env.GALLERY_NAME }}/images/${{ env.IMAGE_DEFINITION }}/versions/${{ env.BUILD_DATE }}",
+                  "replicationRegions": [
+                    "${{ env.LOCATION }}"
+                  ],
+                  "runOutputName": "SharedImageGalleryDistribute",
+                  "excludeFromLatest": false
+                }
+              ],
+              "validationMode": "Incremental",
+              "timeoutInMinutes": 120
+            }
+          }
+          TEMPLATE_EOF
+          echo "✓ Image template created"
+      
+      - name: Deploy Image Builder template
+        run: |
+          echo "Deploying Image Builder template: ${{ env.TEMPLATE_NAME }}"
+          az resource create \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --properties @image-template.json \
+            --name ${{ env.TEMPLATE_NAME }} \
+            --resource-type "Microsoft.VirtualMachineImages/imageTemplates" \
+            --is-full-object
+          echo "✓ Template deployed"
+      
+      - name: Start image build
+        run: |
+          echo "Starting image build (this will take 15-30 minutes)..."
+          az resource invoke-action \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --resource-name ${{ env.TEMPLATE_NAME }} \
+            --resource-type "Microsoft.VirtualMachineImages/imageTemplates" \
+            --action Run
+          echo "✓ Build started"
+      
+      - name: Wait for build completion
+        run: |
+          echo "Monitoring build status..."
+          max_attempts=180
+          attempt=0
+          
+          while [ $attempt -lt $max_attempts ]; do
+            STATUS=$(az resource show \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --resource-name ${{ env.TEMPLATE_NAME }} \
+              --resource-type "Microsoft.VirtualMachineImages/imageTemplates" \
+              --query "properties.lastRunStatus.runState" \
+              -o tsv 2>/dev/null || echo "Building")
+            
+            RUN_OUTPUT=$(az resource show \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --resource-name ${{ env.TEMPLATE_NAME }} \
+              --resource-type "Microsoft.VirtualMachineImages/imageTemplates" \
+              --query "properties.lastRunStatus" \
+              -o json 2>/dev/null || echo "{}")
+            
+            if [ "$STATUS" = "Succeeded" ]; then
+              echo "✓ Image build SUCCEEDED!"
+              echo "Build details: $RUN_OUTPUT"
+              exit 0
+            elif [ "$STATUS" = "Failed" ]; then
+              echo "✗ Image build FAILED!"
+              echo "Build details: $RUN_OUTPUT"
+              exit 1
+            fi
+            
+            echo "Build status: $STATUS (Attempt $((attempt+1))/$max_attempts)"
+            attempt=$((attempt+1))
+            sleep 30
+          done
+          
+          echo "✗ Build timeout reached (90 minutes)"
+          exit 1
+      
+      - name: Verify image in gallery
+        run: |
+          echo "Verifying image in Shared Image Gallery..."
+          az sig image-version list \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --gallery-name ${{ env.GALLERY_NAME }} \
+            --gallery-image-definition ${{ env.IMAGE_DEFINITION }} \
+            --query "[0].[name, publishingProfile.publishedDate, id]" \
+            -o table
+          echo "✓ Image successfully published to gallery"
+      
+      - name: Cleanup Image Builder template
+        if: always()
+        run: |
+          echo "Cleaning up Image Builder template..."
+          az resource delete \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --resource-name ${{ env.TEMPLATE_NAME }} \
+            --resource-type "Microsoft.VirtualMachineImages/imageTemplates" \
+            --yes \
+            -o none 2>/dev/null || true
+          echo "✓ Template cleaned up"
+      
+      - name: Job summary
+        if: always()
+        run: |
+          echo "## Golden Image Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Template Name**: ${{ env.TEMPLATE_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: ${{ env.BUILD_DATE }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Gallery**: ${{ env.GALLERY_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image Definition**: ${{ env.IMAGE_DEFINITION }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Region**: ${{ env.LOCATION }}" >> $GITHUB_STEP_SUMMARY
